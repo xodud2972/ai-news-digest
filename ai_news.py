@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""매일 아침 AI 뉴스 다이제스트 → Slack.
+
+GitHub Actions cron으로 트리거. 어제 (월요일이면 금~일) AI 기사를 RSS에서
+수집하여 Claude Haiku로 한국어 요약 + 카테고리 분류 후 Slack Webhook 전송.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+
+import feedparser
+import anthropic
+
+# ─────────────────────────────────────────────────────────
+# 환경 변수
+# ─────────────────────────────────────────────────────────
+SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+
+# ─────────────────────────────────────────────────────────
+# 설정
+# ─────────────────────────────────────────────────────────
+KST = timezone(timedelta(hours=9))
+MODEL = "claude-haiku-4-5-20251001"
+MAX_ARTICLES_FINAL = 10  # Slack에 보낼 최종 기사 수 상한
+
+CATEGORIES = [
+    "모델 출시 & 업데이트",
+    "AI 업계 & 비즈니스",
+    "AI 연구 & 논문",
+    "AI 정책 & 규제",
+]
+
+CATEGORY_EMOJI = {
+    "모델 출시 & 업데이트": "🚀",
+    "AI 업계 & 비즈니스": "💼",
+    "AI 연구 & 논문": "🔬",
+    "AI 정책 & 규제": "⚖️",
+}
+
+# RSS 소스 — 카테고리별로 분리하지 않고 전부 합쳐서 Claude가 분류하게 함.
+FEEDS = [
+    # Google News 검색 기반 (영문, 최신성 높음)
+    "https://news.google.com/rss/search?q=artificial+intelligence&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=AI+model+release+launch&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=AI+startup+funding+acquisition&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=AI+research+breakthrough&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=AI+regulation+policy&hl=en-US&gl=US&ceid=US:en",
+    # Google News 한국 (한글 기사도 일부 수집)
+    "https://news.google.com/rss/search?q=AI+%EC%9D%B8%EA%B3%B5%EC%A7%80%EB%8A%A5&hl=ko&gl=KR&ceid=KR:ko",
+    # 전문 매체 RSS
+    "https://techcrunch.com/category/artificial-intelligence/feed/",
+    "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+    "https://venturebeat.com/category/ai/feed/",
+]
+
+# ─────────────────────────────────────────────────────────
+# 1) 날짜 범위 결정
+# ─────────────────────────────────────────────────────────
+def date_range() -> tuple[date, date, str]:
+    """평일: 어제 하루 / 월요일: 지난 금요일~일요일 3일치."""
+    today = datetime.now(KST).date()
+    dow = today.weekday()  # 0=Mon
+    if dow == 0:  # Monday
+        start = today - timedelta(days=3)
+        end = today - timedelta(days=1)
+        label = f"{start.strftime('%Y-%m-%d (금)')} ~ {end.strftime('%Y-%m-%d (일)')} 주말 포함 3일"
+    else:
+        start = end = today - timedelta(days=1)
+        weekday_ko = ["월", "화", "수", "목", "금", "토", "일"][start.weekday()]
+        label = f"{start.strftime('%Y-%m-%d')} ({weekday_ko})"
+    return start, end, label
+
+
+# ─────────────────────────────────────────────────────────
+# 2) RSS에서 기사 수집
+# ─────────────────────────────────────────────────────────
+def _parse_entry_date(entry) -> datetime | None:
+    """RSS entry에서 발행 시각 뽑기 (KST 기준 datetime)."""
+    try:
+        if getattr(entry, "published_parsed", None):
+            dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+        elif getattr(entry, "updated_parsed", None):
+            dt = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
+        elif hasattr(entry, "published"):
+            dt = parsedate_to_datetime(entry.published)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            return None
+        return dt.astimezone(KST)
+    except Exception:
+        return None
+
+
+def _clean_summary(text: str) -> str:
+    """HTML 태그 제거 + 공백 정리."""
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:400]
+
+
+def fetch_all_articles(start: date, end: date) -> list[dict]:
+    """모든 피드 순회하며 날짜 범위 내 기사 수집 + 중복 제거."""
+    seen_titles = set()
+    articles: list[dict] = []
+
+    for feed_url in FEEDS:
+        try:
+            feed = feedparser.parse(feed_url)
+        except Exception as e:
+            print(f"[WARN] feed fetch failed: {feed_url} :: {e}", file=sys.stderr)
+            continue
+
+        for entry in feed.entries:
+            dt = _parse_entry_date(entry)
+            if dt is None:
+                continue
+            if not (start <= dt.date() <= end):
+                continue
+
+            title = getattr(entry, "title", "").strip()
+            if not title:
+                continue
+
+            # 아주 느슨한 dedup: 제목 앞 60자 기준
+            key = title[:60].lower()
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+
+            articles.append({
+                "title": title,
+                "link": getattr(entry, "link", ""),
+                "summary": _clean_summary(getattr(entry, "summary", "")),
+                "source": getattr(feed.feed, "title", "Unknown"),
+                "published": dt.isoformat(),
+            })
+
+    # 신선한 순으로 정렬
+    articles.sort(key=lambda a: a["published"], reverse=True)
+    return articles
+
+
+# ─────────────────────────────────────────────────────────
+# 3) Claude로 분류 + 요약
+# ─────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """당신은 AI 뉴스 큐레이터입니다. 주어진 영문/국문 AI 관련 기사 목록에서 \
+가장 중요하고 흥미로운 기사들을 선별하고, 카테고리로 분류하여 한국어로 요약합니다.
+
+출력 규칙:
+- 반드시 유효한 JSON 배열만 출력 (설명 텍스트 금지, 코드펜스 금지)
+- 각 원소: {"id": 원본 번호(int), "category": 카테고리명, "title_ko": "한국어 제목", "summary_ko": "2-3문장 한국어 요약"}
+- 카테고리는 정확히 다음 중 하나: "모델 출시 & 업데이트", "AI 업계 & 비즈니스", "AI 연구 & 논문", "AI 정책 & 규제"
+- 각 카테고리당 최대 3개, 전체 최대 10개
+- 중복 주제는 하나로 통합
+- 명확히 AI와 관련 없는 기사는 제외
+- summary_ko는 원문 20단어 이상 연속 복사 금지, 반드시 재작성
+- title_ko는 원문 핵심을 담되 간결하게 (30자 이내 권장)
+"""
+
+
+def summarize_with_claude(articles: list[dict]) -> list[dict]:
+    """Claude에 기사 목록을 넘겨 선별 + 분류 + 한국어 요약 받기."""
+    if not articles:
+        return []
+
+    # 입력이 너무 많으면 상위 40개만 (토큰 절약)
+    trimmed = articles[:40]
+    user_parts = ["다음은 어제 발행된 AI 관련 기사들입니다. 선별+분류+요약해주세요.\n\n"]
+    for i, a in enumerate(trimmed):
+        user_parts.append(f"[{i}] 제목: {a['title']}\n")
+        user_parts.append(f"    설명: {a['summary'][:300]}\n")
+        user_parts.append(f"    출처: {a['source']}\n\n")
+    user_text = "".join(user_parts)
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    msg = client.messages.create(
+        model=MODEL,
+        max_tokens=4000,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_text}],
+    )
+    raw = msg.content[0].text.strip()
+
+    # 혹시 코드펜스로 감쌌으면 제거
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+
+    try:
+        selected = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Claude JSON parse failed: {e}\nraw={raw[:500]}", file=sys.stderr)
+        return []
+
+    # 원본 링크 매핑
+    enriched = []
+    for item in selected:
+        idx = item.get("id")
+        if not isinstance(idx, int) or not (0 <= idx < len(trimmed)):
+            continue
+        original = trimmed[idx]
+        if item.get("category") not in CATEGORIES:
+            continue
+        enriched.append({
+            "category": item["category"],
+            "title_ko": item.get("title_ko", original["title"]),
+            "summary_ko": item.get("summary_ko", ""),
+            "link": original["link"],
+            "source": original["source"],
+        })
+
+    return enriched[:MAX_ARTICLES_FINAL]
+
+
+# ─────────────────────────────────────────────────────────
+# 4) Slack 메시지 포맷팅 (mrkdwn)
+# ─────────────────────────────────────────────────────────
+def build_slack_message(items: list[dict], label: str, total_candidates: int) -> str:
+    today_str = datetime.now(KST).strftime("%Y년 %m월 %d일 (%a)")
+    weekday_ko = ["월", "화", "수", "목", "금", "토", "일"][datetime.now(KST).weekday()]
+    today_str = datetime.now(KST).strftime(f"%Y년 %m월 %d일 ({weekday_ko})")
+
+    lines = [
+        f"📰 *AI 뉴스 다이제스트 — {today_str}*",
+        f"_{label}의 주요 AI 소식_",
+        "",
+    ]
+
+    if not items:
+        lines.append("⚠️ 오늘은 수집된 AI 뉴스가 없어요.")
+        lines.append(f"_수집 후보 기사 수: {total_candidates}개_")
+        return "\n".join(lines)
+
+    # 카테고리별 그룹핑
+    by_cat: dict[str, list[dict]] = {c: [] for c in CATEGORIES}
+    for item in items:
+        by_cat[item["category"]].append(item)
+
+    for cat in CATEGORIES:
+        cat_items = by_cat[cat]
+        if not cat_items:
+            continue
+        lines.append("━━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+        lines.append(f"{CATEGORY_EMOJI[cat]} *{cat}*")
+        lines.append("")
+        for i, it in enumerate(cat_items, 1):
+            lines.append(f"{i}. *{it['title_ko']}*")
+            lines.append(f"   {it['summary_ko']}")
+            lines.append(f"   🔗 <{it['link']}|원문 보기> · _{it['source']}_")
+            lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"_총 {len(items)}개 기사 (후보 {total_candidates}개 중 선별) | 다음 업데이트: 내일_")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────
+# 5) Slack 전송
+# ─────────────────────────────────────────────────────────
+def send_to_slack(message: str) -> None:
+    payload = json.dumps({"text": message}).encode("utf-8")
+    req = urllib.request.Request(
+        SLACK_WEBHOOK_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        body = resp.read().decode()
+        status = resp.status
+        print(f"[SLACK] status={status} body={body}")
+        if status != 200 or body != "ok":
+            raise RuntimeError(f"Slack 전송 실패: {status} {body}")
+
+
+# ─────────────────────────────────────────────────────────
+# main
+# ─────────────────────────────────────────────────────────
+def main() -> int:
+    start, end, label = date_range()
+    print(f"[INFO] 날짜 범위: {start} ~ {end} ({label})")
+
+    articles = fetch_all_articles(start, end)
+    print(f"[INFO] 수집된 기사 후보: {len(articles)}개")
+
+    if not articles:
+        send_to_slack(
+            f"⚠️ *AI 뉴스 다이제스트*\n\n"
+            f"{label} 기간의 AI 관련 기사를 찾지 못했어요.\n"
+            f"RSS 소스에 문제가 있는지 확인이 필요합니다."
+        )
+        return 0
+
+    try:
+        selected = summarize_with_claude(articles)
+    except Exception as e:
+        print(f"[ERROR] Claude 요약 실패: {e}", file=sys.stderr)
+        send_to_slack(
+            f"⚠️ *AI 뉴스 다이제스트 — 요약 실패*\n\n"
+            f"기사 {len(articles)}개를 수집했지만 Claude 요약 중 오류가 발생했습니다.\n"
+            f"오류: `{e}`"
+        )
+        return 1
+
+    print(f"[INFO] 최종 선별 기사: {len(selected)}개")
+    for cat in CATEGORIES:
+        count = sum(1 for it in selected if it["category"] == cat)
+        print(f"  - {cat}: {count}개")
+
+    message = build_slack_message(selected, label, len(articles))
+    send_to_slack(message)
+    print("[DONE]")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
