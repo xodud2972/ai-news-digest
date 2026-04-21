@@ -2,7 +2,7 @@
 """매일 아침 AI 뉴스 다이제스트 → Slack.
 
 GitHub Actions cron으로 트리거. 어제 (월요일이면 금~일) AI 기사를 RSS에서 수집하여
-OpenAI GPT로 한국어 요약 + 생각해볼 점 + 개발자 관점 의견 + 카테고리 분류 후 Slack 전송.
+OpenAI GPT로 한국어 요약 + 시사점 + 개발자 관점 의견 + AI 시각 분석 후 Slack 전송.
 """
 
 from __future__ import annotations
@@ -31,20 +31,7 @@ KST = timezone(timedelta(hours=9))
 MODEL = "gpt-4o-mini"
 MAX_ARTICLES_FINAL = 10  # Slack에 보낼 최종 기사 수 상한
 
-CATEGORIES = [
-    "모델 출시 & 업데이트",
-    "AI 업계 & 비즈니스",
-    "AI 연구 & 논문",
-    "AI 정책 & 규제",
-]
-CATEGORY_EMOJI = {
-    "모델 출시 & 업데이트": "🚀",
-    "AI 업계 & 비즈니스": "💼",
-    "AI 연구 & 논문": "🔬",
-    "AI 정책 & 규제": "⚖️",
-}
-
-# RSS 소스 — 카테고리별로 분리하지 않고 전부 합쳐서 GPT가 분류하게 함.
+# RSS 소스 — 전부 합쳐서 GPT가 선별하게 함.
 FEEDS = [
     # Google News 검색 기반 (영문, 최신성 높음)
     "https://news.google.com/rss/search?q=artificial+intelligence&hl=en-US&gl=US&ceid=US:en",
@@ -155,54 +142,59 @@ def fetch_all_articles(start: date, end: date) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────
-# 3) OpenAI로 분류 + 심화 분석
+# 3) OpenAI로 선별 + 심화 분석
 # ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """당신은 AI 뉴스 큐레이터 겸 실용적인 개발자 관점의 분석가입니다. \
 주어진 영문/국문 AI 관련 기사 목록에서 가장 중요하고 흥미로운 기사들을 선별하고, \
-카테고리로 분류한 뒤 한국어로 심화 분석합니다.
+한국어로 심화 분석합니다.
 
-중요: 사용자는 영문 원문을 읽지 않습니다. 따라서 요약·생각해볼 점·개발자 의견이 \
+중요: 사용자는 영문 원문을 읽지 않습니다. 따라서 요약·시사점·개발자 의견·AI 시각이 \
 기사를 대신할 수 있을 만큼 실질적인 정보를 담고 있어야 합니다.
 
 출력 규칙:
 - 반드시 유효한 JSON 배열만 출력 (설명 텍스트 금지, 코드펜스 금지)
 - 각 원소는 다음 키를 모두 포함:
   * "id": 원본 번호 (int)
-  * "category": 카테고리명 (아래 목록에서 정확히 하나)
   * "title_ko": 한국어 제목 (30자 이내 권장)
   * "summary_ko": 한국어 요약 5-6문장. 원문의 맥락 / 핵심 / 수치 / 주요 인물·회사까지 포함.
-  * "think_points": 문자열 배열 3-4개. 이 기사와 함께 고려하면 좋을 포인트.
-      예) 업계 트렌드·경쟁사 동향과의 연결, 선행 사례, 잠재적 리스크, 유사 기술 시도 비교 등.
+  * "implications": 문자열 배열 3-4개. 이 기사가 **시사하는 바** 또는 **함께 고민해보면 좋을 주변 맥락**.
+      예) 업계 전반에 주는 함의, 선행·경쟁 사례와의 연결, 잠재적 파급 효과,
+          이 뉴스가 암시하는 산업 방향성, 놓치기 쉬운 이면의 이슈 등.
+      단순히 "생각해볼 포인트"가 아니라, 기사 본문 바깥의 맥락과 연결하는 인사이트 중심으로.
       각 포인트는 한 문장으로 구체적으로.
   * "dev_opinion": 실무 개발자 관점의 의견 3-4문장.
       - 이 기술/뉴스가 실제 업무나 프로덕트에 어떻게 쓰일 수 있는가
       - 도입 시 장벽·한계는 무엇인가 (비용, 성능, 생태계, 라이선스 등)
       - 현재 상용화 수준인지 실험 단계인지
       - 지금 바로 해볼 만한 구체적 제안 (예: "허깅페이스에서 ○○ 모델 받아서 로컬 테스트" 같이)
-
-카테고리 선택지 (반드시 이 중 하나):
-  "모델 출시 & 업데이트", "AI 업계 & 비즈니스", "AI 연구 & 논문", "AI 정책 & 규제"
+  * "ai_opinion": AI 본인의 관점에서 본 의견 3-4문장.
+      - 이 뉴스가 AI 발전의 큰 흐름에서 어떤 위치에 있는지
+      - AI 모델·기술 관점에서 흥미롭거나 우려되는 지점
+      - 다른 AI 연구·제품 흐름과의 비교, 혹은 업계가 놓치고 있는 포인트
+      - 단순 찬양·긍정 금지. 필요하면 비판적·회의적 시각도 담을 것.
+      - "나는 AI로서 ~" 같은 진부한 말투는 피하고, 자연스럽고 담백한 논평으로.
 
 분량/스타일 규칙:
-- 각 카테고리당 최대 3개, 전체 최대 10개
+- 전체 최대 10개 기사 선별 (중요도·흥미도 높은 순)
 - 중복 주제는 하나로 통합 (가장 신뢰도 높은 기사 기준)
 - 명확히 AI와 관련 없는 기사는 제외
 - summary_ko는 원문을 20단어 이상 연속 복사 금지. 반드시 재작성.
-- think_points와 dev_opinion은 일반적 업계 지식을 활용해 구체적이고 실용적으로 작성.
+- implications·dev_opinion·ai_opinion은 일반적 업계 지식을 활용해 구체적이고 실용적으로 작성.
   추측성 내용은 "~일 가능성", "~것으로 보임" 등으로 톤 조절.
 - 모든 한국어 출력은 평어체(해요체 아님)로 일관.
+- 본문에 이모지 사용 금지 (Slack 포맷은 코드에서 처리).
 """
 
 
 def summarize_with_openai(articles: list[dict]) -> list[dict]:
-    """OpenAI에 기사 목록을 넘겨 선별 + 분류 + 한국어 심화 분석."""
+    """OpenAI에 기사 목록을 넘겨 선별 + 한국어 심화 분석."""
     if not articles:
         return []
 
     # 입력이 너무 많으면 상위 40개만 (토큰 절약)
     trimmed = articles[:40]
 
-    user_parts = ["다음은 어제 발행된 AI 관련 기사들입니다. 선별+분류+심화 분석해주세요.\n\n"]
+    user_parts = ["다음은 어제 발행된 AI 관련 기사들입니다. 중요도 순으로 최대 10개 선별하고 심화 분석해주세요.\n\n"]
     for i, a in enumerate(trimmed):
         user_parts.append(f"[{i}] 제목: {a['title']}\n")
         user_parts.append(f"    설명: {a['summary'][:300]}\n")
@@ -236,21 +228,18 @@ def summarize_with_openai(articles: list[dict]) -> list[dict]:
         if not isinstance(idx, int) or not (0 <= idx < len(trimmed)):
             continue
         original = trimmed[idx]
-        if item.get("category") not in CATEGORIES:
-            continue
 
-        think = item.get("think_points") or []
-        if not isinstance(think, list):
-            think = []
-        # 모두 문자열로 정규화
-        think = [str(p).strip() for p in think if str(p).strip()]
+        implications = item.get("implications") or []
+        if not isinstance(implications, list):
+            implications = []
+        implications = [str(p).strip() for p in implications if str(p).strip()]
 
         enriched.append({
-            "category": item["category"],
             "title_ko": item.get("title_ko", original["title"]),
             "summary_ko": item.get("summary_ko", ""),
-            "think_points": think[:4],
+            "implications": implications[:4],
             "dev_opinion": str(item.get("dev_opinion", "")).strip(),
+            "ai_opinion": str(item.get("ai_opinion", "")).strip(),
             "link": original["link"],
             "source": original["source"],
         })
@@ -265,62 +254,56 @@ def build_slack_message(items: list[dict], label: str, total_candidates: int) ->
     weekday_ko = ["월", "화", "수", "목", "금", "토", "일"][datetime.now(KST).weekday()]
     today_str = datetime.now(KST).strftime(f"%Y년 %m월 %d일 ({weekday_ko})")
 
+    divider = "━━━━━━━━━━━━━━━━━━━━━━━"
+
     lines = [
-        f"📰 *AI 뉴스 다이제스트 — {today_str}*",
-        f"_{label}의 주요 AI 소식_",
-        "",
+        f"*AI 뉴스 다이제스트 — {today_str}*",
+        f"_{label}의 주요 소식 · 총 {len(items)}개 기사_",
     ]
 
     if not items:
-        lines.append("⚠️ 오늘은 수집된 AI 뉴스가 없어요.")
+        lines.append("")
+        lines.append("오늘은 수집된 AI 뉴스가 없어요.")
         lines.append(f"_수집 후보 기사 수: {total_candidates}개_")
         return "\n".join(lines)
 
-    # 카테고리별 그룹핑
-    by_cat: dict[str, list[dict]] = {c: [] for c in CATEGORIES}
-    for item in items:
-        by_cat[item["category"]].append(item)
-
-    for cat in CATEGORIES:
-        cat_items = by_cat[cat]
-        if not cat_items:
-            continue
-        lines.append("━━━━━━━━━━━━━━━━━━━")
+    for i, it in enumerate(items, 1):
         lines.append("")
-        lines.append(f"{CATEGORY_EMOJI[cat]} *{cat}*")
+        lines.append(divider)
         lines.append("")
-        for i, it in enumerate(cat_items, 1):
-            # 제목
-            lines.append(f"*{i}. {it['title_ko']}*")
+        lines.append(f"*{i}. {it['title_ko']}*")
+        lines.append("")
 
-            # 요약
-            summary = it.get("summary_ko", "").strip()
-            if summary:
-                lines.append(f"📄 {summary}")
-                lines.append("")
-
-            # 생각해볼 점
-            think = it.get("think_points") or []
-            if think:
-                lines.append("🤔 *생각해볼 점*")
-                for p in think:
-                    lines.append(f"   • {p}")
-                lines.append("")
-
-            # 개발자 관점
-            opinion = it.get("dev_opinion", "").strip()
-            if opinion:
-                lines.append("💡 *개발자 관점*")
-                lines.append(opinion)
-                lines.append("")
-
-            # 링크
-            lines.append(f"🔗 <{it['link']}|원문 보기> · _{it['source']}_")
+        summary = it.get("summary_ko", "").strip()
+        if summary:
+            lines.append(summary)
             lines.append("")
 
-    lines.append("━━━━━━━━━━━━━━━━━━━")
+        implications = it.get("implications") or []
+        if implications:
+            lines.append("*시사점 · 함께 볼 맥락*")
+            for p in implications:
+                lines.append(f"•  {p}")
+            lines.append("")
+
+        dev_opinion = it.get("dev_opinion", "").strip()
+        if dev_opinion:
+            lines.append("*개발자 관점*")
+            lines.append(dev_opinion)
+            lines.append("")
+
+        ai_opinion = it.get("ai_opinion", "").strip()
+        if ai_opinion:
+            lines.append("*AI의 시각*")
+            lines.append(ai_opinion)
+            lines.append("")
+
+        lines.append(f"<{it['link']}|원문 보기>  ·  _{it['source']}_")
+
+    lines.append("")
+    lines.append(divider)
     lines.append(
-        f"_총 {len(items)}개 기사 (후보 {total_candidates}개 중 선별) | 다음 업데이트: 내일 아침 9시_"
+        f"_총 {len(items)}개 기사 (후보 {total_candidates}개 중 선별) · 다음 업데이트: 내일 아침 9시_"
     )
     return "\n".join(lines)
 
@@ -355,7 +338,7 @@ def main() -> int:
 
     if not articles:
         send_to_slack(
-            f"⚠️ *AI 뉴스 다이제스트*\n\n"
+            f"*AI 뉴스 다이제스트*\n\n"
             f"{label} 기간의 AI 관련 기사를 찾지 못했어요.\n"
             f"RSS 소스에 문제가 있는지 확인이 필요합니다."
         )
@@ -366,16 +349,13 @@ def main() -> int:
     except Exception as e:
         print(f"[ERROR] OpenAI 요약 실패: {e}", file=sys.stderr)
         send_to_slack(
-            f"⚠️ *AI 뉴스 다이제스트 — 요약 실패*\n\n"
+            f"*AI 뉴스 다이제스트 — 요약 실패*\n\n"
             f"기사 {len(articles)}개를 수집했지만 OpenAI 요약 중 오류가 발생했습니다.\n"
             f"오류: `{e}`"
         )
         return 1
 
     print(f"[INFO] 최종 선별 기사: {len(selected)}개")
-    for cat in CATEGORIES:
-        count = sum(1 for it in selected if it["category"] == cat)
-        print(f"  - {cat}: {count}개")
 
     message = build_slack_message(selected, label, len(articles))
     print(f"[INFO] Slack 메시지 길이: {len(message)} chars")
