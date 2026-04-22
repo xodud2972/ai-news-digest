@@ -36,13 +36,7 @@ FEEDS = [
     # Google News 검색 기반 (영문, 최신성 높음)
     "https://news.google.com/rss/search?q=artificial+intelligence&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=AI+model+release+launch&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=AI+startup+funding+acquisition&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=AI+research+breakthrough&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=AI+regulation+policy&hl=en-US&gl=US&ceid=US:en",
-    # Google News 한국 (한글 기사도 일부 수집)
-    "https://news.google.com/rss/search?q=AI+%EC%9D%B8%EA%B3%B5%EC%A7%80%EB%8A%A5&hl=ko&gl=KR&ceid=KR:ko",
     # 영문 전문 매체 RSS
-    "https://techcrunch.com/category/artificial-intelligence/feed/",
     "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
     "https://venturebeat.com/category/ai/feed/",
     # AI 전문 해외 매체 (추가)
@@ -145,11 +139,11 @@ def fetch_all_articles(start: date, end: date) -> list[dict]:
 # 3) OpenAI로 선별 + 심화 분석
 # ─────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """당신은 AI 뉴스 큐레이터 겸 실용적인 개발자 관점의 분석가입니다. \
-주어진 영문/국문 AI 관련 기사 목록에서 가장 중요하고 흥미로운 기사들을 선별하고, \
+주어진 영문/국문 AI 관련 기사 목록에서 가장 중요하고 뜨겁게 이슈되는 기사들을 선별하고, \
 한국어로 심화 분석합니다.
 
 중요: 사용자는 영문 원문을 읽지 않습니다. 따라서 요약·시사점·개발자 의견·AI 시각이 \
-기사를 대신할 수 있을 만큼 실질적인 정보를 담고 있어야 합니다.
+기사를 대신할 수 있을 만큼 실질적인 정보를 담고 있어야 합니다. 반드시 15개의 기사를 가져와야합니다. 만약 총 수집한 기사개수가 15개가 되지 않는다면 총 수집한 개수만큼 모두 가져옵니다.
 
 출력 규칙:
 - 반드시 유효한 JSON 배열만 출력 (설명 텍스트 금지, 코드펜스 금지)
