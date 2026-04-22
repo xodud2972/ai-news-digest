@@ -28,15 +28,24 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 # 설정
 # ─────────────────────────────────────────────────────────
 KST = timezone(timedelta(hours=9))
-MODEL = "gpt-4o-mini"
+# gpt-4o-mini는 "정확히 N개 선별" 같은 엄격한 수량 지시를 잘 안 따름 →
+# 지시 이행 능력이 훨씬 좋은 gpt-4o 사용 (하루 1회 배치라 비용 부담 미미)
+MODEL = "gpt-4o"
 MAX_ARTICLES_FINAL = 15  # Slack에 보낼 최종 기사 수 상한
+TARGET_ARTICLES = 15     # GPT가 맞춰야 할 목표 기사 수
 
 # RSS 소스 — 전부 합쳐서 GPT가 선별하게 함.
 FEEDS = [
     # Google News 검색 기반 (영문, 최신성 높음)
     "https://news.google.com/rss/search?q=artificial+intelligence&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=AI+model+release+launch&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=AI+startup+funding+acquisition&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=AI+research+breakthrough&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=AI+regulation+policy&hl=en-US&gl=US&ceid=US:en",
+    # Google News 한국 (한글 기사도 일부 수집)
+    "https://news.google.com/rss/search?q=AI+%EC%9D%B8%EA%B3%B5%EC%A7%80%EB%8A%A5&hl=ko&gl=KR&ceid=KR:ko",
     # 영문 전문 매체 RSS
+    "https://techcrunch.com/category/artificial-intelligence/feed/",
     "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
     "https://venturebeat.com/category/ai/feed/",
     # AI 전문 해외 매체 (추가)
@@ -135,48 +144,86 @@ def fetch_all_articles(start: date, end: date) -> list[dict]:
     return articles
 
 
+def diversify_by_source(articles: list[dict], limit: int) -> list[dict]:
+    """한 매체가 입력을 점유하지 않도록 출처별 라운드로빈으로 섞음.
+
+    AI타임스처럼 발행량 많은 매체가 최신순 정렬 상위를 독점하면 GPT 입력이
+    그 매체 기사로만 채워져 결과도 편중됨. 출처별로 돌아가며 뽑아서 균형 확보.
+    """
+    from collections import defaultdict, deque
+
+    buckets: dict[str, deque] = defaultdict(deque)
+    for a in articles:
+        buckets[a["source"]].append(a)
+
+    result: list[dict] = []
+    # 빈 버킷을 제거하면서 라운드로빈
+    while buckets and len(result) < limit:
+        empty = []
+        for src, bucket in list(buckets.items()):
+            if not bucket:
+                empty.append(src)
+                continue
+            result.append(bucket.popleft())
+            if len(result) >= limit:
+                break
+        for src in empty:
+            del buckets[src]
+    return result
+
+
 # ─────────────────────────────────────────────────────────
 # 3) OpenAI로 선별 + 심화 분석
 # ─────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """당신은 AI 뉴스 큐레이터 겸 실용적인 개발자 관점의 분석가입니다. \
-주어진 영문/국문 AI 관련 기사 목록에서 가장 중요하고 뜨겁게 이슈되는 기사들을 선별하고, \
-한국어로 심화 분석합니다.
+SYSTEM_PROMPT = """당신은 AI 뉴스 큐레이터 겸 실용적인 개발자 관점의 분석가입니다.
+주어진 영문/국문 AI 관련 기사 후보에서 기사를 선별하고 한국어로 심화 분석합니다.
 
-중요: 사용자는 영문 원문을 읽지 않습니다. 따라서 요약·시사점·개발자 의견·AI 시각이 \
-기사를 대신할 수 있을 만큼 실질적인 정보를 담고 있어야 합니다. 반드시 15개의 기사를 가져와야합니다. 만약 총 수집한 기사개수가 15개가 되지 않는다면 총 수집한 개수만큼 모두 가져옵니다.
+사용자는 영문 원문을 읽지 않습니다. 따라서 요약·시사점·개발자 의견·AI 시각이
+기사를 대신할 수 있을 만큼 실질적인 정보를 담고 있어야 합니다.
 
-출력 규칙:
-- 반드시 유효한 JSON 배열만 출력 (설명 텍스트 금지, 코드펜스 금지)
-- 각 원소는 다음 키를 모두 포함:
-  * "id": 원본 번호 (int)
-  * "title_ko": 한국어 제목 (30자 이내 권장)
-  * "summary_ko": 한국어 요약 5-6문장. 원문의 맥락 / 핵심 / 수치 / 주요 인물·회사까지 포함.
-  * "implications": 문자열 배열 3-4개. 이 기사가 **시사하는 바** 또는 **함께 고민해보면 좋을 주변 맥락**.
-      예) 업계 전반에 주는 함의, 선행·경쟁 사례와의 연결, 잠재적 파급 효과,
-          이 뉴스가 암시하는 산업 방향성, 놓치기 쉬운 이면의 이슈 등.
-      단순히 "생각해볼 포인트"가 아니라, 기사 본문 바깥의 맥락과 연결하는 인사이트 중심으로.
-      각 포인트는 한 문장으로 구체적으로.
-  * "dev_opinion": 실무 개발자 관점의 의견 3-4문장.
-      - 이 기술/뉴스가 실제 업무나 프로덕트에 어떻게 쓰일 수 있는가
-      - 도입 시 장벽·한계는 무엇인가 (비용, 성능, 생태계, 라이선스 등)
-      - 현재 상용화 수준인지 실험 단계인지
-      - 지금 바로 해볼 만한 구체적 제안 (예: "허깅페이스에서 ○○ 모델 받아서 로컬 테스트" 같이)
-  * "ai_opinion": AI 본인의 관점에서 본 의견 3-4문장.
-      - 이 뉴스가 AI 발전의 큰 흐름에서 어떤 위치에 있는지
-      - AI 모델·기술 관점에서 흥미롭거나 우려되는 지점
-      - 다른 AI 연구·제품 흐름과의 비교, 혹은 업계가 놓치고 있는 포인트
-      - 단순 찬양·긍정 금지. 필요하면 비판적·회의적 시각도 담을 것.
-      - "나는 AI로서 ~" 같은 진부한 말투는 피하고, 자연스럽고 담백한 논평으로.
+=== 출력 형식 ===
+- 반드시 유효한 JSON 오브젝트만 출력: {"articles": [ ... ]} 형태.
+- articles 배열의 길이는 **정확히 N개** (사용자 메시지에서 지정됨). 후보가 N개 미만이면 후보 수만큼만.
+- articles 각 원소 스키마:
+  {
+    "id": <int, 원본 번호>,
+    "title_ko": <str, 한국어 제목 30자 이내 권장>,
+    "summary_ko": <str, 한국어 요약 5-6문장. 맥락·핵심·수치·인물/회사 포함>,
+    "implications": <str[] 3-4개>,
+    "dev_opinion": <str, 3-4문장>,
+    "ai_opinion": <str, 3-4문장>
+  }
 
-분량/스타일 규칙:
-- 전체 15개 기사 선별 (중요도·흥미도 높은 순)
-- 중복 주제는 하나로 통합 (가장 신뢰도 높은 기사 기준)
-- 명확히 AI와 관련 없는 기사는 제외
-- summary_ko는 원문을 20단어 이상 연속 복사 금지. 반드시 재작성.
-- implications·dev_opinion·ai_opinion은 일반적 업계 지식을 활용해 구체적이고 실용적으로 작성.
+=== 각 필드 가이드 ===
+implications: 이 기사가 **시사하는 바** 또는 **함께 고민해보면 좋을 주변 맥락**.
+  단순 "생각해볼 포인트"가 아니라, 기사 본문 바깥의 업계 맥락·선행 사례·잠재적 파급 효과·
+  암시되는 산업 방향성 등과 연결하는 인사이트. 한 문장씩 구체적으로.
+
+dev_opinion: 실무 개발자 관점 의견 3-4문장. 실제 업무/프로덕트 적용 방안, 도입 장벽(비용·
+  성능·생태계·라이선스), 상용화 수준, 지금 해볼 만한 구체적 제안(예: "허깅페이스에서 ○○
+  모델 받아 로컬 테스트") 포함.
+
+ai_opinion: AI 본인 관점의 논평 3-4문장. AI 발전 큰 흐름에서의 위치, 모델·기술 관점에서
+  흥미롭거나 우려되는 지점, 다른 연구·제품 흐름과의 비교, 업계가 놓치는 포인트 등.
+  단순 찬양 금지. 필요하면 비판적·회의적 시각 환영. "나는 AI로서 ~" 같은 진부한 말투 피할 것.
+
+=== 선별 기준 ===
+1. **수량을 반드시 채울 것.** 후보가 충분한데도 임의로 줄이지 말 것. 중요도 애매한 기사도
+   흥미로운 각도(기술적 디테일, 업계 시사점, 비판적 분석 등)를 찾아 목표 개수를 채운다.
+2. **매체 다양성.** 한 매체(특히 AI타임스·Google News 등)가 전체의 50%를 넘지 않게. 해외 매체
+   (TechCrunch·The Verge·VentureBeat·the-decoder)와 국내 매체를 섞을 것.
+3. **주제 다양성.** 모델 출시 / 업계·비즈니스 / 연구·논문 / 정책·규제 / 응용사례가 골고루.
+   한 주제가 전체의 40%를 넘지 않게.
+4. 중복 주제는 하나로 통합 (가장 신뢰도 높은 기사 기준).
+5. 명확히 AI와 관련 없는 기사는 제외.
+
+=== 스타일 ===
+- summary_ko는 원문을 20단어 이상 연속 복사 금지. 재작성.
+- implications·dev_opinion·ai_opinion은 일반 업계 지식을 활용해 구체적이고 실용적으로.
   추측성 내용은 "~일 가능성", "~것으로 보임" 등으로 톤 조절.
-- 모든 한국어 출력은 평어체(해요체 아님)로 일관.
-- 본문에 이모지 사용 금지 (Slack 포맷은 코드에서 처리).
+- 모든 한국어는 평어체(해요체 아님)로 일관.
+- 본문에 이모지 사용 금지.
+- 중요도·흥미도 높은 순으로 배열 앞쪽에 배치.
 """
 
 
@@ -185,14 +232,30 @@ def summarize_with_openai(articles: list[dict]) -> list[dict]:
     if not articles:
         return []
 
-    # 입력이 너무 많으면 상위 40개만 (토큰 절약)
-    trimmed = articles[:40]
+    # 매체 다양성 확보 위해 출처별 라운드로빈으로 60개 뽑기
+    trimmed = diversify_by_source(articles, 60)
+    target = min(TARGET_ARTICLES, len(trimmed))
 
-    user_parts = ["다음은 어제 발행된 AI 관련 기사들입니다. 중요도 순으로 최대 15개 선별하고 심화 분석해주세요.\n\n"]
+    # 입력 기사들의 출처 분포 로그
+    from collections import Counter
+    source_counts = Counter(a["source"] for a in trimmed)
+    print(f"[INFO] GPT 입력: {len(trimmed)}개, 출처 분포: {dict(source_counts)}")
+
+    user_parts = [
+        f"AI 관련 기사 후보 {len(trimmed)}개입니다.\n",
+        f"**반드시 정확히 {target}개를 선별**해서 JSON 배열로 출력하세요.\n",
+        f"배열 길이가 {target}이 아니면 응답이 무효입니다.\n",
+        "매체·주제 다양성을 반드시 확보하세요.\n\n",
+        "=== 후보 기사 ===\n",
+    ]
     for i, a in enumerate(trimmed):
         user_parts.append(f"[{i}] 제목: {a['title']}\n")
         user_parts.append(f"    설명: {a['summary'][:300]}\n")
         user_parts.append(f"    출처: {a['source']}\n\n")
+    user_parts.append(
+        f"\n=== 최종 체크 ===\n"
+        f"출력 JSON 배열의 길이가 정확히 {target}개인지 확인 후 응답하세요.\n"
+    )
     user_text = "".join(user_parts)
 
     client = OpenAI(api_key=OPENAI_API_KEY)
@@ -203,21 +266,42 @@ def summarize_with_openai(articles: list[dict]) -> list[dict]:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_text},
         ],
+        response_format={"type": "json_object"},
     )
 
     raw = (response.choices[0].message.content or "").strip()
-    # 혹시 코드펜스로 감쌌으면 제거
+    # json_object 모드여서 {"items": [...]} 형태로 올 수 있음 → 배열 추출
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
 
     try:
-        selected = json.loads(raw)
+        parsed = json.loads(raw)
     except json.JSONDecodeError as e:
         print(f"[ERROR] OpenAI JSON parse failed: {e}\nraw={raw[:500]}", file=sys.stderr)
         return []
 
+    # json_object 모드는 반드시 오브젝트여야 함. 배열을 감싸는 키를 찾아서 꺼낸다
+    if isinstance(parsed, dict):
+        # 흔한 키 이름들 탐색
+        for key in ("articles", "items", "results", "selected", "data", "list"):
+            if isinstance(parsed.get(key), list):
+                selected = parsed[key]
+                break
+        else:
+            # 첫 번째 list 값 사용
+            list_vals = [v for v in parsed.values() if isinstance(v, list)]
+            selected = list_vals[0] if list_vals else []
+    elif isinstance(parsed, list):
+        selected = parsed
+    else:
+        selected = []
+
+    print(f"[INFO] GPT 반환 항목 수: {len(selected)} (목표: {target})")
+
     # 원본 링크 매핑
     enriched = []
     for item in selected:
+        if not isinstance(item, dict):
+            continue
         idx = item.get("id")
         if not isinstance(idx, int) or not (0 <= idx < len(trimmed)):
             continue
@@ -238,6 +322,7 @@ def summarize_with_openai(articles: list[dict]) -> list[dict]:
             "source": original["source"],
         })
 
+    print(f"[INFO] 유효성 검증 후 최종 항목 수: {len(enriched)}")
     return enriched[:MAX_ARTICLES_FINAL]
 
 
